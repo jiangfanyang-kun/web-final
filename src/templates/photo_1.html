@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <title>Title</title>
+</head>
+<body>
+<style type="text/css">
+   img {
+    width: 180px;
+    height: 120px;
+    object-fit: contain;
+    margin: 8px;
+    padding: 4px;
+    background: #111;
+    border-radius: 6px;
+    vertical-align: top;
+}
+</style>
+<p>车辆撞线图</p>
+<div></div>
+<script>
+    const div = document.querySelector('div');
+
+    const loadedIds = new Set();
+    let currentId = 1;
+
+    function tryLoadNext() {
+        if (currentId > 1000) {
+            return;
+        }
+
+        const id = currentId++;
+        const src =
+            "../static/save_img/" +
+            id +
+            ".jpg?v=" +
+            id;
+
+        const img = new Image();
+
+        img.onload = function () {
+            if (loadedIds.has(id)) {
+                return;
+            }
+
+            loadedIds.add(id);
+            img.dataset.trackId = id;
+            div.appendChild(img);
+        };
+
+        img.onerror = function () {
+            // 不存在直接跳过
+        };
+
+        img.src = src;
+    }
+
+    setInterval(tryLoadNext, 80);
+</script>
+</body>
+</html>

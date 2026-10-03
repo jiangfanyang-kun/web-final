@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="zh">
+
+<head>
+
+    <meta charset="UTF-8">
+
+    <title>事故检测</title>
+
+    <style>
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            padding: 20px;
+            background: #081a33;
+            color: white;
+            font-family:
+                "Microsoft YaHei",
+                Arial,
+                sans-serif;
+        }
+
+        h2 {
+            margin-top: 0;
+            color: #ffffff;
+        }
+
+        .main {
+            display: flex;
+            gap: 20px;
+            align-items: flex-start;
+        }
+
+        .video-box {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .video-title {
+            margin-bottom: 10px;
+            font-size: 18px;
+            color: #20e0d0;
+        }
+
+        #accident-stream {
+            width: 100%;
+            max-height: 650px;
+            object-fit: contain;
+            background: #020b18;
+            border: 2px solid #086b86;
+            border-radius: 8px;
+        }
+
+        .shot-box {
+            width: 430px;
+            min-height: 400px;
+        }
+
+        .shot-title {
+            margin-bottom: 10px;
+            font-size: 18px;
+            color: #ff6262;
+        }
+
+        #empty-tip {
+            color: #aab7c8;
+            padding: 20px 0;
+        }
+
+        #shot-grid {
+            display: grid;
+            grid-template-columns:
+                repeat(2, 1fr);
+            gap: 10px;
+        }
+
+        .shot-card {
+            background: #111;
+            padding: 6px;
+            border-radius: 7px;
+            border: 1px solid #263e5d;
+        }
+
+        .shot-card img {
+            display: block;
+            width: 100%;
+            height: 130px;
+            object-fit: contain;
+            background: #000;
+        }
+
+        .shot-name {
+            margin-top: 5px;
+            font-size: 13px;
+            color: #ddd;
+            text-align: center;
+        }
+
+    </style>
+
+</head>
+
+<body>
+
+    <h2>车辆事故检测</h2>
+
+    <div class="main">
+
+        <div class="video-box">
+
+            <div class="video-title">
+                事故检测视频
+            </div>
+
+            <img
+                id="accident-stream"
+                src="/accident_video_feed"
+                alt="事故检测视频"
+            >
+
+        </div>
+
+        <div class="shot-box">
+
+            <div class="shot-title">
+                事故抓拍记录
+            </div>
+
+            <div id="empty-tip">
+                暂未检测到事故
+            </div>
+
+            <div id="shot-grid">
+            </div>
+
+        </div>
+
+    </div>
+
+    <script>
+
+        const grid =
+            document.getElementById(
+                'shot-grid'
+            );
+
+        const emptyTip =
+            document.getElementById(
+                'empty-tip'
+            );
+
+        const loaded =
+            new Set();
+
+
+        async function refreshShots() {
+
+            try {
+
+                const response =
+                    await fetch(
+                        '/accident_images'
+                    );
+
+                const files =
+                    await response.json();
+
+                if (files.length > 0) {
+
+                    emptyTip.style.display =
+                        'none';
+
+                }
+
+                for (
+                    const filename
+                    of files
+                ) {
+
+                    if (
+                        loaded.has(
+                            filename
+                        )
+                    ) {
+                        continue;
+                    }
+
+                    loaded.add(
+                        filename
+                    );
+
+                    const card =
+                        document.createElement(
+                            'div'
+                        );
+
+                    card.className =
+                        'shot-card';
+
+                    const img =
+                        document.createElement(
+                            'img'
+                        );
+
+                    img.src =
+                        '/static/save_accident/'
+                        + filename;
+
+                    const name =
+                        document.createElement(
+                            'div'
+                        );
+
+                    name.className =
+                        'shot-name';
+
+                    name.textContent =
+                        '事故抓拍 '
+                        + filename;
+
+                    card.appendChild(
+                        img
+                    );
+
+                    card.appendChild(
+                        name
+                    );
+
+                    grid.appendChild(
+                        card
+                    );
+
+                }
+
+            }
+            catch (error) {
+
+                console.log(
+                    '事故截图读取失败:',
+                    error
+                );
+
+            }
+
+        }
+
+        refreshShots();
+
+        setInterval(
+            refreshShots,
+            1000
+        );
+
+    </script>
+
+</body>
+
+</html>

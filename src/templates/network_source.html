@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+
+<html lang="zh">
+
+<head>
+
+    <meta charset="UTF-8">
+
+    <title>实时道路监测</title>
+
+    <style>
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            background: #081a33;
+            color: white;
+
+            font-family:
+                "Microsoft YaHei",
+                Arial,
+                sans-serif;
+        }
+
+        .page {
+            width: 900px;
+            margin: 80px auto;
+        }
+
+        .title {
+            font-size: 32px;
+            font-weight: bold;
+            margin-bottom: 10px;
+        }
+
+        .subtitle {
+            color: #91a1b8;
+            margin-bottom: 40px;
+        }
+
+        .panel {
+            background: #10233d;
+
+            border:
+                1px solid #254765;
+
+            border-radius: 12px;
+
+            padding: 35px;
+        }
+
+        .label {
+            font-size: 17px;
+            margin-bottom: 12px;
+        }
+
+        .stream-input {
+            width: 100%;
+            height: 48px;
+
+            padding: 0 15px;
+
+            border-radius: 6px;
+
+            border:
+                1px solid #3d5c7c;
+
+            background: #091a2e;
+            color: white;
+
+            font-size: 15px;
+        }
+
+        .stream-input:focus {
+            outline: none;
+            border-color: #44a8f2;
+        }
+
+        .support {
+            margin-top: 12px;
+            color: #7f91aa;
+            font-size: 13px;
+        }
+
+        .buttons {
+            margin-top: 30px;
+        }
+
+        .btn {
+            border: none;
+
+            border-radius: 6px;
+
+            padding: 13px 30px;
+
+            font-size: 15px;
+
+            cursor: pointer;
+        }
+
+        .connect {
+            background: #44a8f2;
+            color: white;
+        }
+
+        .back {
+            margin-left: 10px;
+
+            background: #293b53;
+            color: white;
+        }
+
+        .status {
+            margin-top: 35px;
+
+            padding: 18px;
+
+            border-radius: 8px;
+
+            background: #0c1e34;
+
+            color: #98a9bd;
+        }
+
+        .dot {
+            display: inline-block;
+
+            width: 9px;
+            height: 9px;
+
+            margin-right: 8px;
+
+            border-radius: 50%;
+
+            background: #777;
+        }
+
+    </style>
+
+</head>
+
+
+<body>
+
+<div class="page">
+
+    <div class="title">
+        实时道路监测
+    </div>
+
+    <div class="subtitle">
+        接入公开或已授权的网络道路视频流
+    </div>
+
+
+    <div class="panel">
+
+        <div class="label">
+            网络视频流地址
+        </div>
+
+        <input
+            id="stream-url"
+            class="stream-input"
+            type="text"
+            placeholder="请输入 HTTP / HLS / RTSP 视频流地址"
+        >
+
+
+        <div class="support">
+            支持方向：HTTP 视频流、HLS (.m3u8)、RTSP
+        </div>
+
+
+        <div class="buttons">
+
+            <button
+                class="btn connect"
+                id="connect-btn"
+            >
+                连接视频流
+            </button>
+
+
+            <button
+                class="btn back"
+                onclick="history.back()"
+            >
+                返回
+            </button>
+
+        </div>
+
+
+        <div class="status">
+
+            <span class="dot"></span>
+
+            当前状态：
+            <span id="status-text">
+                尚未连接
+            </span>
+
+        </div>
+
+    </div>
+
+</div>
+
+<script>
+
+    const connectBtn =
+        document.querySelector(
+            '#connect-btn'
+        );
+
+    const streamInput =
+        document.querySelector(
+            '#stream-url'
+        );
+
+    const statusText =
+        document.querySelector(
+            '#status-text'
+        );
+
+    const statusDot =
+        document.querySelector(
+            '.dot'
+        );
+
+
+    connectBtn.addEventListener(
+        'click',
+        async function () {
+
+            const url =
+                streamInput
+                    .value
+                    .trim();
+
+
+            // ============================
+            // 地址不能为空
+            // ============================
+
+            if (!url) {
+
+                alert(
+                    '请输入网络视频流地址'
+                );
+
+                return;
+            }
+
+
+            // ============================
+            // 正在连接
+            // ============================
+
+            connectBtn.disabled = true;
+
+            connectBtn.innerText =
+                '正在连接...';
+
+            statusText.innerText =
+                '正在尝试连接视频流';
+
+            statusDot.style.background =
+                '#f4b942';
+
+
+            try {
+
+                const response =
+                    await fetch(
+                        '/connect_network_stream',
+                        {
+                            method: 'POST',
+
+                            headers: {
+                                'Content-Type':
+                                    'application/json'
+                            },
+
+                            body: JSON.stringify({
+                                url: url
+                            })
+                        }
+                    );
+
+
+                const result =
+                    await response.json();
+
+
+                // ========================
+                // 连接成功
+                // ========================
+
+                if (result.success) {
+
+                    statusText.innerText =
+                        result.message;
+
+                    statusDot.style.background =
+                        '#37d67a';
+
+                    connectBtn.innerText =
+                        '连接成功';
+
+
+                    // 稍微停留一下
+                    // 让用户看到连接成功状态
+                    setTimeout(
+                        function () {
+
+                            window.location.href =
+                                result.redirect;
+
+                        },
+                        800
+                    );
+
+                    return;
+                }
+
+
+                // ========================
+                // 连接失败
+                // ========================
+
+                statusText.innerText =
+                    result.message;
+
+                statusDot.style.background =
+                    '#ff4d4f';
+
+                connectBtn.disabled = false;
+
+                connectBtn.innerText =
+                    '重新连接';
+
+            }
+            catch (error) {
+
+                console.error(
+                    error
+                );
+
+                statusText.innerText =
+                    '服务器连接失败';
+
+                statusDot.style.background =
+                    '#ff4d4f';
+
+                connectBtn.disabled = false;
+
+                connectBtn.innerText =
+                    '重新连接';
+            }
+
+        }
+    );
+
+</script>
+
+</body>
+
+</html>
