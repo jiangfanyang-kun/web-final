@@ -9,7 +9,7 @@
         #data {
             margin: 20px 30px 30px 30px;
             color: white;
-            height: 468px;
+            height: 280px;
             overflow: hidden;
         }
         #data .data_box {
@@ -107,6 +107,33 @@
             <div class="div_any_child">
                 <div class="div_any_title"><img src="../static/img/title_4.png">来往车辆ID和类型统计 </div>
                 <div id="data"></div>
+                <div id="traffic-alert-panel" style="
+    width: 100%;
+    box-sizing: border-box;
+    margin-top: 10px;
+    padding: 10px;
+    background: rgba(255,255,255,0.06);
+    border-radius: 6px;
+">
+
+    <div style="
+        font-size: 16px;
+        font-weight: bold;
+        margin-bottom: 8px;
+    ">
+        实时预警中心
+    </div>
+
+    <div id="traffic-alert-list" style="
+        max-height: 180px;
+        overflow-y: auto;
+        font-size: 13px;
+        line-height: 1.7;
+    ">
+        暂无预警
+    </div>
+
+</div>
                 <div style="margin-left: 70px;">
                     <button class="btn" id="analyse">流量分析</button>
                     <a href="/photo_1.html" style="color: white" target="_blank"><button class="btn" style="margin-left: 20px;">通过取景</button></a>
@@ -166,12 +193,184 @@
             success: function (data) {
                 let code = "";
                 for (var i = 0 ; i < data.length; i++){
-                    let info = "目标ID：" + data[i].id + "，目标类型：" + data[i].label;
+                   let info =
+    "目标ID：" + data[i].id
+    + "，目标类型：" + data[i].label
+    + "，速度：" + Number(data[i].speed_px_s || 0).toFixed(2) + " px/s"
+    + "，状态：" + (data[i].motion_status || "未知")
+    + "，静止：" + Number(data[i].stationary_duration || 0).toFixed(2) + "s"
+    + "，预警：" + (data[i].warning_status || "正常");
                     let div = '<div class="data_box">' + info + "</div>";
                     code = div + code;
                 }
                 let ele_data = document.getElementById("data");
                 ele_data.innerHTML = code;
+            }
+        });
+                // =====================================================
+        // 实时交通预警中心
+        // =====================================================
+
+        $.ajax({
+            url: "./json_traffic_alerts.json",
+            type: "GET",
+            dataType: "json",
+            async: false,
+
+            success: function (data) {
+
+                let alertList =
+                    document.getElementById(
+                        "traffic-alert-list"
+                    );
+
+                // 没有预警
+                if (
+                    !Array.isArray(data)
+                    ||
+                    data.length === 0
+                ) {
+
+                    alertList.innerHTML =
+                        '<div style="color:#8fd3ff;">'
+                        + '暂无预警'
+                        + '</div>';
+
+                    return;
+                }
+
+
+                let code = "";
+
+                for (
+                    let i = 0;
+                    i < data.length;
+                    i++
+                ) {
+
+                    let item = data[i];
+
+                    // -----------------------------------------
+                    // 风险等级显示
+                    // -----------------------------------------
+
+                    let levelText = "低风险";
+                    let levelColor = "#ffd666";
+
+                    if (item.level === "high") {
+
+                        levelText = "高风险";
+                        levelColor = "#ff4d4f";
+
+                    } else if (
+                        item.level === "medium"
+                    ) {
+
+                        levelText = "中风险";
+                        levelColor = "#fa8c16";
+                    }
+
+
+                    // -----------------------------------------
+                    // 预警类型中文名称
+                    // -----------------------------------------
+
+                    let typeText = "交通风险";
+
+                    if (
+                        item.type
+                        ===
+                        "abnormal_stop"
+                    ) {
+
+                        typeText = "异常停车";
+
+                    } else if (
+                        item.type
+                        ===
+                        "wrong_way"
+                    ) {
+
+                        typeText = "逆行预警";
+
+                    } else if (
+                        item.type
+                        ===
+                        "collision_risk"
+                    ) {
+
+                        typeText = "碰撞风险";
+
+                    } else if (
+                        item.type
+                        ===
+                        "pedestrian_risk"
+                    ) {
+
+                        typeText = "人车冲突";
+
+                    } else if (
+                        item.type
+                        ===
+                        "following_too_close"
+                    ) {
+
+                        typeText = "跟车过近";
+                    }
+
+
+                    // -----------------------------------------
+                    // 单条预警 HTML
+                    // -----------------------------------------
+
+                    let div =
+                        '<div style="'
+                        + 'margin-bottom:6px;'
+                        + 'padding:6px 8px;'
+                        + 'background:rgba(0,0,0,0.18);'
+                        + 'border-left:3px solid '
+                        + levelColor
+                        + ';'
+                        + '">'
+
+                        + '<span style="color:'
+                        + levelColor
+                        + ';font-weight:bold;">'
+                        + '['
+                        + levelText
+                        + '] '
+                        + typeText
+                        + '</span>'
+
+                        + '<br>'
+
+                        + '<span style="color:#ffffff;">'
+                        + (
+                            item.message
+                            ||
+                            "检测到交通风险"
+                        )
+                        + '</span>'
+
+                        + '</div>';
+
+                    code += div;
+                }
+
+                alertList.innerHTML = code;
+            },
+
+            error: function () {
+
+                let alertList =
+                    document.getElementById(
+                        "traffic-alert-list"
+                    );
+
+                alertList.innerHTML =
+                    '<div style="color:#999;">'
+                    + '预警数据暂不可用'
+                    + '</div>';
             }
         });
     }

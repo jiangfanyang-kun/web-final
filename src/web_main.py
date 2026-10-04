@@ -74,7 +74,24 @@ ACTIVE_VIDEO_SOURCE = TRAFFIC_VIDEO_PATH
 
 # 网络视频流地址
 NETWORK_STREAM_URL = None
+# ==========================================================
+# 逆行检测配置
+# ==========================================================
 
+# 当前道路允许的正常行驶方向
+#
+# 可选：
+# 'left'
+# 'right'
+# 'up'
+# 'down'
+#
+# None 表示暂时没有配置道路方向。
+# 等后面统一测试视频时再填写真实方向。
+EXPECTED_TRAFFIC_DIRECTION = None
+
+# 连续反方向行驶多久才确认逆行
+REVERSE_CONFIRM_SECONDS = 1.5
 # ==========================================================
 # 两套功能各自独立的截图目录
 # ==========================================================
@@ -455,7 +472,11 @@ def get_json_3():
 @app.route("/json_dict_label.json", methods=['GET'])
 def get_json_5():
     return render_template('json_dict_label.json')
-
+@app.route("/json_traffic_alerts.json", methods=['GET'])
+def get_json_traffic_alerts():
+    return render_template(
+        'json_traffic_alerts.json'
+    )
 
 @app.route("/detector_config.json", methods=['GET'])
 def get_json_4():
@@ -835,6 +856,21 @@ def detect_gen():
 
     # TrafficAnalyzer 使用的视频帧计数
     analysis_frame_index = 0
+    # ==========================================================
+    # 交通状态防抖
+    # ==========================================================
+
+    # 网页当前真正显示的稳定状态
+    stable_style = '畅通'
+
+    # 正在等待确认的新状态
+    candidate_style = '畅通'
+
+    # 新状态第一次出现的时间
+    candidate_style_since = None
+
+    # 新状态至少持续多少秒才正式切换
+    STYLE_HOLD_SECONDS = 2.0
     # 设备使用情况
     if torch.cuda.is_available():
         print(
@@ -884,9 +920,19 @@ def detect_gen():
     JSON_WRITE_INTERVAL = 0.2
 
     last_json_write_time = 0.0
+    # ==========================================================
+    # 交通预警短时保留
+    #
+    # 某些 TTC / 人车冲突风险可能只持续很短时间，
+    # 为避免前端 1 秒轮询时刚好错过，
+    # 已触发的预警在预警中心保留 3 秒。
+    # ==========================================================
 
+    TRAFFIC_ALERT_HOLD_SECONDS = 3.0
+
+    traffic_alert_cache = {}
     base_filename = os.path.join(
-        os.getcwd(),
+        PROJECT_ROOT,
         'src'
     )
     def calc_shot_score(frame, c1, c2, scale_x, scale_y):
@@ -1093,7 +1139,1113 @@ def detect_gen():
             timestamp=analysis_timestamp,
             frame_shape=im.shape
         )
+        # ==========================================================
+        # TTC 碰撞风险分析
+        # ==========================================================
 
+        traffic_ttc_risks = traffic_analyzer.get_ttc_risks(
+            max_ttc_seconds=3.0,
+            collision_distance_px=50.0,
+            min_closing_speed_px_s=10.0,
+            lookback_seconds=0.8
+        )
+
+        # ----------------------------------------------------------
+        # 把“车辆对风险”整理成“单车风险”
+        #
+        # 例如：
+        # ID 12 和 ID 18 有碰撞风险
+        #
+        # 则：
+        # 12 -> 对方 18
+        # 18 -> 对方 12
+        # ----------------------------------------------------------
+
+        ttc_risk_by_track = {}
+
+        for risk in traffic_ttc_risks:
+
+            track_id_a = int(
+                risk['track_id_a']
+            )
+
+            track_id_b = int(
+                risk['track_id_b']
+            )
+
+            # ID A 的风险信息
+            info_a = {
+                'other_track_id': track_id_b,
+                'ttc_seconds': risk['ttc_seconds'],
+                'risk_level': risk['risk_level'],
+                'predicted_distance_px': risk[
+                    'predicted_distance_px'
+                ],
+                'closing_speed_px_s': risk[
+                    'closing_speed_px_s'
+                ]
+            }
+
+            # ID B 的风险信息
+            info_b = {
+                'other_track_id': track_id_a,
+                'ttc_seconds': risk['ttc_seconds'],
+                'risk_level': risk['risk_level'],
+                'predicted_distance_px': risk[
+                    'predicted_distance_px'
+                ],
+                'closing_speed_px_s': risk[
+                    'closing_speed_px_s'
+                ]
+            }
+
+            # 一辆车如果同时与多辆车有风险，
+            # 只保留 TTC 最小、最危险的那一组
+            old_a = ttc_risk_by_track.get(
+                track_id_a
+            )
+
+            if (
+                    old_a is None
+                    or
+                    info_a['ttc_seconds']
+                    <
+                    old_a['ttc_seconds']
+            ):
+                ttc_risk_by_track[
+                    track_id_a
+                ] = info_a
+
+            old_b = ttc_risk_by_track.get(
+                track_id_b
+            )
+
+            if (
+                    old_b is None
+                    or
+                    info_b['ttc_seconds']
+                    <
+                    old_b['ttc_seconds']
+            ):
+                ttc_risk_by_track[
+                    track_id_b
+                ] = info_b
+        # ==========================================================
+        # 人车冲突风险分析
+        # ==========================================================
+
+        pedestrian_vehicle_risks = (
+            traffic_analyzer.get_pedestrian_vehicle_risks(
+                max_prediction_seconds=3.0,
+                conflict_distance_px=60.0,
+                min_closing_speed_px_s=5.0,
+                lookback_seconds=0.8
+            )
+        )
+
+        # ----------------------------------------------------------
+        # 按车辆 ID 整理人车冲突风险
+        #
+        # 一辆车如果同时与多个行人有风险，
+        # 只保留时间最短、最危险的一组
+        # ----------------------------------------------------------
+
+        pedestrian_risk_by_vehicle = {}
+
+        for risk in pedestrian_vehicle_risks:
+
+            vehicle_id = int(
+                risk['vehicle_id']
+            )
+
+            person_id = int(
+                risk['person_id']
+            )
+
+            risk_info = {
+                'person_id': person_id,
+
+                'conflict_seconds': risk[
+                    'conflict_seconds'
+                ],
+
+                'risk_level': risk[
+                    'risk_level'
+                ],
+
+                'predicted_distance_px': risk[
+                    'predicted_distance_px'
+                ],
+
+                'closing_speed_px_s': risk[
+                    'closing_speed_px_s'
+                ]
+            }
+
+            old_info = pedestrian_risk_by_vehicle.get(
+                vehicle_id
+            )
+
+            if (
+                    old_info is None
+                    or
+                    risk_info['conflict_seconds']
+                    <
+                    old_info['conflict_seconds']
+            ):
+                pedestrian_risk_by_vehicle[
+                    vehicle_id
+                ] = risk_info
+        # ==========================================================
+        # 跟车过近 / 安全距离风险分析
+        # ==========================================================
+
+        following_distance_risks = (
+            traffic_analyzer.get_following_distance_risks(
+                safe_gap_scale=2.0,
+                lateral_scale=0.9,
+                min_speed_px_s=8.0
+            )
+        )
+
+        # ----------------------------------------------------------
+        # 按“后车 ID”整理风险
+        #
+        # 跟车过近主要对后车发出预警：
+        #
+        # rear_track_id  -> 后车
+        # front_track_id -> 前车
+        #
+        # 如果同一辆后车同时出现多个风险，
+        # 只保留 gap_ratio 最小、最危险的一组。
+        # ----------------------------------------------------------
+
+        following_risk_by_vehicle = {}
+
+        for risk in following_distance_risks:
+
+            rear_track_id = int(
+                risk['rear_track_id']
+            )
+
+            front_track_id = int(
+                risk['front_track_id']
+            )
+
+            risk_info = {
+                'front_track_id': front_track_id,
+
+                'risk_level': risk[
+                    'risk_level'
+                ],
+
+                'longitudinal_gap_px': risk[
+                    'longitudinal_gap_px'
+                ],
+
+                'safe_distance_px': risk[
+                    'safe_distance_px'
+                ],
+
+                'gap_ratio': risk[
+                    'gap_ratio'
+                ],
+
+                'closing_speed_px_s': risk[
+                    'closing_speed_px_s'
+                ],
+
+                'direction': risk[
+                    'direction'
+                ]
+            }
+
+            old_info = following_risk_by_vehicle.get(
+                rear_track_id
+            )
+
+            if (
+                    old_info is None
+                    or
+                    risk_info['gap_ratio']
+                    <
+                    old_info['gap_ratio']
+            ):
+                following_risk_by_vehicle[
+                    rear_track_id
+                ] = risk_info
+        # ==========================================================
+        # 当前画面活动车辆详细信息
+        # ID + 类型 + 相对速度 + 运动状态
+        # ==========================================================
+
+        active_vehicle_list = []
+
+        for item_bbox in list_bboxs:
+
+            (
+                x1,
+                y1,
+                x2,
+                y2,
+                label,
+                track_id,
+                confidence
+            ) = item_bbox
+
+            # 当前右侧列表暂时不显示行人
+            if label == 'person':
+                continue
+
+            track_info = traffic_analyzer.get_track(
+                track_id
+            )
+
+            if track_info is None:
+                continue
+            direction_info = traffic_analyzer.get_motion_direction(
+                track_id
+            )
+
+            motion_direction = direction_info[
+                'direction'
+            ]
+
+            direction_dx = direction_info[
+                'dx'
+            ]
+
+            direction_dy = direction_info[
+                'dy'
+            ]
+
+            direction_distance = direction_info[
+                'distance_px'
+            ]
+            # ==========================================================
+            # 逆行检测
+            # ==========================================================
+
+            reverse_info = traffic_analyzer.check_reverse_direction(
+                track_id=track_id,
+                expected_direction=EXPECTED_TRAFFIC_DIRECTION,
+                min_reverse_seconds=REVERSE_CONFIRM_SECONDS
+            )
+
+            is_reverse = reverse_info[
+                'is_reverse'
+            ]
+
+            reverse_duration = reverse_info[
+                'reverse_duration'
+            ]
+
+            expected_direction = reverse_info[
+                'expected_direction'
+            ]
+
+            actual_direction = reverse_info[
+                'actual_direction'
+            ]
+
+            if is_reverse:
+                reverse_status = '逆行'
+            else:
+                reverse_status = '正常'
+            speed_px_s = track_info[
+                'speed_px_s'
+            ]
+            stationary_duration = track_info[
+                'stationary_duration'
+            ]
+            if (
+                    speed_px_s
+                    <=
+                    traffic_analyzer.stationary_speed_px_s
+            ):
+                motion_status = '静止'
+            else:
+                motion_status = '移动'
+
+            # ==========================================================
+            # 异常停车初步判断
+            # 连续静止 >= 5 秒，进入停车预警
+            # ==========================================================
+
+            if stationary_duration >= 5.0:
+                warning_status = '异常停车'
+            else:
+                warning_status = '正常'
+
+            # ==========================================================
+            # 当前车辆 TTC 风险
+            # ==========================================================
+
+            ttc_info = ttc_risk_by_track.get(
+                int(track_id)
+            )
+
+            if ttc_info is None:
+
+                has_ttc_risk = False
+                ttc_other_id = None
+                ttc_seconds = None
+                ttc_risk_level = 'none'
+                ttc_predicted_distance = None
+                ttc_closing_speed = None
+
+            else:
+
+                has_ttc_risk = True
+
+                ttc_other_id = ttc_info[
+                    'other_track_id'
+                ]
+
+                ttc_seconds = ttc_info[
+                    'ttc_seconds'
+                ]
+
+                ttc_risk_level = ttc_info[
+                    'risk_level'
+                ]
+
+                ttc_predicted_distance = ttc_info[
+                    'predicted_distance_px'
+                ]
+
+                ttc_closing_speed = ttc_info[
+                    'closing_speed_px_s'
+                ]
+            # ==========================================================
+            # 当前车辆的人车冲突风险
+            # ==========================================================
+
+            pedestrian_risk_info = (
+                pedestrian_risk_by_vehicle.get(
+                    int(track_id)
+                )
+            )
+
+            if pedestrian_risk_info is None:
+
+                has_pedestrian_risk = False
+
+                pedestrian_risk_person_id = None
+
+                pedestrian_conflict_seconds = None
+
+                pedestrian_risk_level = 'none'
+
+                pedestrian_predicted_distance = None
+
+                pedestrian_closing_speed = None
+
+            else:
+
+                has_pedestrian_risk = True
+
+                pedestrian_risk_person_id = (
+                    pedestrian_risk_info[
+                        'person_id'
+                    ]
+                )
+
+                pedestrian_conflict_seconds = (
+                    pedestrian_risk_info[
+                        'conflict_seconds'
+                    ]
+                )
+
+                pedestrian_risk_level = (
+                    pedestrian_risk_info[
+                        'risk_level'
+                    ]
+                )
+
+                pedestrian_predicted_distance = (
+                    pedestrian_risk_info[
+                        'predicted_distance_px'
+                    ]
+                )
+
+                pedestrian_closing_speed = (
+                    pedestrian_risk_info[
+                        'closing_speed_px_s'
+                    ]
+                )
+            # ==========================================================
+            # 当前车辆跟车过近风险
+            # ==========================================================
+
+            following_info = (
+                following_risk_by_vehicle.get(
+                    int(track_id)
+                )
+            )
+
+            if following_info is None:
+
+                has_following_risk = False
+
+                following_front_id = None
+
+                following_risk_level = 'none'
+
+                following_gap_px = None
+
+                following_safe_distance_px = None
+
+                following_gap_ratio = None
+
+                following_closing_speed = None
+
+                following_direction = None
+
+            else:
+
+                has_following_risk = True
+
+                following_front_id = following_info[
+                    'front_track_id'
+                ]
+
+                following_risk_level = following_info[
+                    'risk_level'
+                ]
+
+                following_gap_px = following_info[
+                    'longitudinal_gap_px'
+                ]
+
+                following_safe_distance_px = following_info[
+                    'safe_distance_px'
+                ]
+
+                following_gap_ratio = following_info[
+                    'gap_ratio'
+                ]
+
+                following_closing_speed = following_info[
+                    'closing_speed_px_s'
+                ]
+
+                following_direction = following_info[
+                    'direction'
+                ]
+            active_vehicle_list.append(
+                {
+                    'id': str(track_id),
+
+                    'label': label,
+
+                    'speed_px_s': round(
+                        speed_px_s,
+                        2
+                    ),
+
+                    'motion_status': motion_status,
+
+                    'stationary_duration': round(
+                        stationary_duration,
+                        2
+                    ),
+
+                    'warning_status': warning_status,
+
+                    # ------------------------------
+                    # 车辆运动方向
+                    # ------------------------------
+
+                    'motion_direction': motion_direction,
+
+                    'direction_dx': direction_dx,
+
+                    'direction_dy': direction_dy,
+
+                    'direction_distance_px': direction_distance,
+
+                    # ------------------------------
+                    # 逆行检测
+                    # ------------------------------
+
+                    'expected_direction': expected_direction,
+
+                    'actual_direction': actual_direction,
+
+                    'reverse_duration': reverse_duration,
+
+                            'is_reverse': is_reverse,
+
+        'reverse_status': reverse_status,
+
+        # ------------------------------
+        # TTC 碰撞风险
+        # ------------------------------
+
+        'has_ttc_risk': has_ttc_risk,
+
+        'ttc_other_id': ttc_other_id,
+
+        'ttc_seconds': ttc_seconds,
+
+        'ttc_risk_level': ttc_risk_level,
+
+                'ttc_predicted_distance_px':
+            ttc_predicted_distance,
+
+        'ttc_closing_speed_px_s':
+            ttc_closing_speed,
+
+        # ------------------------------
+        # 人车冲突风险
+        # ------------------------------
+
+        'has_pedestrian_risk':
+            has_pedestrian_risk,
+
+        'pedestrian_risk_person_id':
+            pedestrian_risk_person_id,
+
+        'pedestrian_conflict_seconds':
+            pedestrian_conflict_seconds,
+
+        'pedestrian_risk_level':
+            pedestrian_risk_level,
+
+        'pedestrian_predicted_distance_px':
+            pedestrian_predicted_distance,
+
+                'pedestrian_closing_speed_px_s':
+            pedestrian_closing_speed,
+
+        # ------------------------------
+        # 跟车过近 / 安全距离风险
+        # ------------------------------
+
+        'has_following_risk':
+            has_following_risk,
+
+        'following_front_id':
+            following_front_id,
+
+        'following_risk_level':
+            following_risk_level,
+
+        'following_gap_px':
+            following_gap_px,
+
+        'following_safe_distance_px':
+            following_safe_distance_px,
+
+        'following_gap_ratio':
+            following_gap_ratio,
+
+        'following_closing_speed_px_s':
+            following_closing_speed,
+
+        'following_direction':
+            following_direction
+                }
+            )
+        # ==========================================================
+        # 统一交通预警中心
+        #
+        # 将：
+        #   异常停车
+        #   逆行
+        #   TTC 碰撞风险
+        #   人车冲突
+        #   跟车过近
+        #
+        # 统一整理成标准事件列表
+        # ==========================================================
+
+        current_traffic_alerts = []
+
+        # 用于避免同一帧产生重复预警
+        alert_keys = set()
+
+        for vehicle in active_vehicle_list:
+
+            track_id = vehicle[
+                'id'
+            ]
+
+            label = vehicle[
+                'label'
+            ]
+
+            # ======================================================
+            # 1. 异常停车
+            # ======================================================
+
+            if (
+                    vehicle.get(
+                        'warning_status'
+                    )
+                    ==
+                    '异常停车'
+            ):
+
+                alert_key = (
+                    'abnormal_stop',
+                    track_id
+                )
+
+                if alert_key not in alert_keys:
+                    alert_keys.add(
+                        alert_key
+                    )
+
+                    current_traffic_alerts.append(
+                        {
+                            'type':
+                                'abnormal_stop',
+
+                            'level':
+                                'medium',
+
+                            'track_id':
+                                track_id,
+
+                            'related_track_id':
+                                None,
+
+                            'label':
+                                label,
+
+                            'value':
+                                vehicle.get(
+                                    'stationary_duration'
+                                ),
+
+                            'message':
+                                '车辆 ID {} 异常停车'.format(
+                                    track_id
+                                ),
+
+                            'timestamp':
+                                round(
+                                    analysis_timestamp,
+                                    2
+                                )
+                        }
+                    )
+
+            # ======================================================
+            # 2. 逆行
+            # ======================================================
+
+            if vehicle.get(
+                    'is_reverse',
+                    False
+            ):
+
+                alert_key = (
+                    'wrong_way',
+                    track_id
+                )
+
+                if alert_key not in alert_keys:
+                    alert_keys.add(
+                        alert_key
+                    )
+
+                    current_traffic_alerts.append(
+                        {
+                            'type':
+                                'wrong_way',
+
+                            'level':
+                                'high',
+
+                            'track_id':
+                                track_id,
+
+                            'related_track_id':
+                                None,
+
+                            'label':
+                                label,
+
+                            'value':
+                                vehicle.get(
+                                    'reverse_duration'
+                                ),
+
+                            'message':
+                                '车辆 ID {} 疑似逆行'.format(
+                                    track_id
+                                ),
+
+                            'timestamp':
+                                round(
+                                    analysis_timestamp,
+                                    2
+                                )
+                        }
+                    )
+
+            # ======================================================
+            # 3. TTC 车辆碰撞风险
+            # ======================================================
+
+            if vehicle.get(
+                    'has_ttc_risk',
+                    False
+            ):
+
+                other_id = vehicle.get(
+                    'ttc_other_id'
+                )
+
+                # 两辆车都会携带 TTC 信息，
+                # 因此统一排序后去重。
+                pair_ids = sorted(
+                    [
+                        str(track_id),
+                        str(other_id)
+                    ]
+                )
+
+                alert_key = (
+                    'collision_risk',
+                    pair_ids[0],
+                    pair_ids[1]
+                )
+
+                if alert_key not in alert_keys:
+                    alert_keys.add(
+                        alert_key
+                    )
+
+                    current_traffic_alerts.append(
+                        {
+                            'type':
+                                'collision_risk',
+
+                            'level':
+                                vehicle.get(
+                                    'ttc_risk_level',
+                                    'low'
+                                ),
+
+                            'track_id':
+                                track_id,
+
+                            'related_track_id':
+                                other_id,
+
+                            'label':
+                                label,
+
+                            'value':
+                                vehicle.get(
+                                    'ttc_seconds'
+                                ),
+
+                            'message':
+                                (
+                                    '车辆 ID {} 与 ID {} '
+                                    '存在碰撞风险'
+                                ).format(
+                                    track_id,
+                                    other_id
+                                ),
+
+                            'timestamp':
+                                round(
+                                    analysis_timestamp,
+                                    2
+                                )
+                        }
+                    )
+
+            # ======================================================
+            # 4. 人车冲突风险
+            # ======================================================
+
+            if vehicle.get(
+                    'has_pedestrian_risk',
+                    False
+            ):
+
+                person_id = vehicle.get(
+                    'pedestrian_risk_person_id'
+                )
+
+                alert_key = (
+                    'pedestrian_risk',
+                    track_id,
+                    person_id
+                )
+
+                if alert_key not in alert_keys:
+                    alert_keys.add(
+                        alert_key
+                    )
+
+                    current_traffic_alerts.append(
+                        {
+                            'type':
+                                'pedestrian_risk',
+
+                            'level':
+                                vehicle.get(
+                                    'pedestrian_risk_level',
+                                    'low'
+                                ),
+
+                            'track_id':
+                                track_id,
+
+                            'related_track_id':
+                                person_id,
+
+                            'label':
+                                label,
+
+                            'value':
+                                vehicle.get(
+                                    'pedestrian_conflict_seconds'
+                                ),
+
+                            'message':
+                                (
+                                    '车辆 ID {} 与行人 ID {} '
+                                    '存在冲突风险'
+                                ).format(
+                                    track_id,
+                                    person_id
+                                ),
+
+                            'timestamp':
+                                round(
+                                    analysis_timestamp,
+                                    2
+                                )
+                        }
+                    )
+
+            # ======================================================
+            # 5. 跟车过近
+            # ======================================================
+
+            if vehicle.get(
+                    'has_following_risk',
+                    False
+            ):
+
+                front_id = vehicle.get(
+                    'following_front_id'
+                )
+
+                alert_key = (
+                    'following_too_close',
+                    track_id,
+                    front_id
+                )
+
+                if alert_key not in alert_keys:
+                    alert_keys.add(
+                        alert_key
+                    )
+
+                    current_traffic_alerts.append(
+                        {
+                            'type':
+                                'following_too_close',
+
+                            'level':
+                                vehicle.get(
+                                    'following_risk_level',
+                                    'low'
+                                ),
+
+                            'track_id':
+                                track_id,
+
+                            'related_track_id':
+                                front_id,
+
+                            'label':
+                                label,
+
+                            'value':
+                                vehicle.get(
+                                    'following_gap_ratio'
+                                ),
+
+                            'message':
+                                (
+                                    '车辆 ID {} 跟随 ID {} '
+                                    '距离过近'
+                                ).format(
+                                    track_id,
+                                    front_id
+                                ),
+
+                            'timestamp':
+                                round(
+                                    analysis_timestamp,
+                                    2
+                                )
+                        }
+                    )
+
+        # ==========================================================
+        # 高风险排前面
+        # ==========================================================
+
+        alert_level_order = {
+            'high': 0,
+            'medium': 1,
+            'low': 2
+        }
+
+        current_traffic_alerts.sort(
+            key=lambda item:
+            alert_level_order.get(
+                item['level'],
+                99
+            )
+        )
+        # ==========================================================
+        # 预警短时缓存
+        # ==========================================================
+
+        # 当前这一帧检测到的预警写入缓存
+        for alert in current_traffic_alerts:
+
+            alert_type = alert.get(
+                'type'
+            )
+
+            track_id_text = str(
+                alert.get(
+                    'track_id'
+                )
+            )
+
+            related_id_text = str(
+                alert.get(
+                    'related_track_id'
+                )
+            )
+
+            # TTC 碰撞风险属于“两车之间”的对称事件。
+            # ID 12 -> 18 和 18 -> 12
+            # 必须使用同一个缓存键。
+            if (
+                    alert_type
+                    ==
+                    'collision_risk'
+            ):
+
+                pair_ids = sorted(
+                    [
+                        track_id_text,
+                        related_id_text
+                    ]
+                )
+
+                alert_key = (
+                    alert_type,
+                    pair_ids[0],
+                    pair_ids[1]
+                )
+
+            else:
+
+                alert_key = (
+                    alert_type,
+                    track_id_text,
+                    related_id_text
+                )
+
+            cached_alert = dict(
+                alert
+            )
+
+            cached_alert['_last_seen'] = (
+                analysis_timestamp
+            )
+
+            traffic_alert_cache[
+                alert_key
+            ] = cached_alert
+
+
+        # 删除已经消失超过 3 秒的旧预警
+        expired_alert_keys = []
+
+        for (
+            alert_key,
+            cached_alert
+        ) in traffic_alert_cache.items():
+
+            last_seen = cached_alert.get(
+                '_last_seen',
+                analysis_timestamp
+            )
+
+            if (
+                analysis_timestamp
+                - last_seen
+                >
+                TRAFFIC_ALERT_HOLD_SECONDS
+            ):
+                expired_alert_keys.append(
+                    alert_key
+                )
+
+        for alert_key in expired_alert_keys:
+
+            del traffic_alert_cache[
+                alert_key
+            ]
+
+
+        # 重新生成真正写给网页的预警列表
+        current_traffic_alerts = []
+
+        for cached_alert in (
+            traffic_alert_cache.values()
+        ):
+
+            output_alert = dict(
+                cached_alert
+            )
+
+            output_alert.pop(
+                '_last_seen',
+                None
+            )
+
+            current_traffic_alerts.append(
+                output_alert
+            )
+
+
+        # 缓存后的预警再次按照风险等级排序
+        current_traffic_alerts.sort(
+            key=lambda item:
+            alert_level_order.get(
+                item.get(
+                    'level',
+                    'low'
+                ),
+                99
+            )
+        )
+        # ==========================================================
+        # 最近 3 秒交通状态窗口
+        # ==========================================================
+
+        traffic_window = traffic_analyzer.get_window_summary(
+            window_seconds=3.0
+        )
         # 每 60 帧打印一次分析结果
         # 不影响每帧 AI 推理
         if analysis_frame_index % 60 == 0:
@@ -1115,7 +2267,20 @@ def detect_gen():
                     traffic_analysis['class_counts']
                 )
             )
-
+            print(
+                '[WINDOW 3s] '
+                '样本={} '
+                '平均车辆={:.2f} '
+                '平均速度={:.2f}px/s '
+                '静止比例={:.2%} '
+                '平均占用率={:.2%}'.format(
+                    traffic_window['sample_count'],
+                    traffic_window['vehicle_count'],
+                    traffic_window['average_speed_px_s'],
+                    traffic_window['stopped_ratio'],
+                    traffic_window['occupancy_ratio']
+                )
+            )
         # ==========================================================
         # 绘制跟踪结果
         # ==========================================================
@@ -1123,24 +2288,318 @@ def detect_gen():
         output_image_frame = im.copy()
 
         for item_bbox in list_bboxs:
+
             x1, y1, x2, y2, label, track_id, confidence = item_bbox
 
-            # 画检测框
+            # 获取这辆车当前分析状态
+            track_info = traffic_analyzer.get_track(
+                track_id
+            )
+
+            stationary_duration = 0.0
+            is_abnormal_stop = False
+
+            if track_info is not None:
+
+                stationary_duration = float(
+                    track_info.get(
+                        'stationary_duration',
+                        0.0
+                    )
+                )
+
+                if stationary_duration >= 5.0:
+                    is_abnormal_stop = True
+
+            # ======================================================
+            # 逆行检测
+            # ======================================================
+
+            reverse_info = traffic_analyzer.check_reverse_direction(
+                track_id=track_id,
+                expected_direction=EXPECTED_TRAFFIC_DIRECTION,
+                min_reverse_seconds=REVERSE_CONFIRM_SECONDS
+            )
+
+            is_reverse = reverse_info[
+                'is_reverse'
+            ]
+
+            reverse_duration = reverse_info[
+                'reverse_duration'
+            ]
+
+            # ======================================================
+            # 当前目标是否属于车辆
+            # ======================================================
+
+            is_vehicle_target = label in (
+                'car',
+                'bus',
+                'truck',
+                'motorcycle',
+                'bicycle'
+            )
+
+            # 行人不参与逆行、异常停车、跟车过近判断
+            if not is_vehicle_target:
+                is_reverse = False
+                is_abnormal_stop = False
+
+            # ======================================================
+            # 人车冲突风险
+            # ======================================================
+
+            pedestrian_draw_info = (
+                pedestrian_risk_by_vehicle.get(
+                    int(track_id)
+                )
+            )
+
+            has_display_pedestrian_risk = False
+            pedestrian_level = 'none'
+            pedestrian_seconds = None
+            pedestrian_person_id = None
+
+            if pedestrian_draw_info is not None:
+
+                pedestrian_level = pedestrian_draw_info[
+                    'risk_level'
+                ]
+
+                pedestrian_seconds = pedestrian_draw_info[
+                    'conflict_seconds'
+                ]
+
+                pedestrian_person_id = pedestrian_draw_info[
+                    'person_id'
+                ]
+
+                if pedestrian_level in (
+                        'medium',
+                        'high'
+                ):
+                    has_display_pedestrian_risk = True
+
+            # ======================================================
+            # TTC 车辆碰撞风险
+            # ======================================================
+
+            ttc_info = ttc_risk_by_track.get(
+                int(track_id)
+            )
+
+            has_display_ttc_risk = False
+            ttc_level = 'none'
+            ttc_seconds = None
+            ttc_other_id = None
+
+            if ttc_info is not None:
+
+                ttc_level = ttc_info[
+                    'risk_level'
+                ]
+
+                ttc_seconds = ttc_info[
+                    'ttc_seconds'
+                ]
+
+                ttc_other_id = ttc_info[
+                    'other_track_id'
+                ]
+
+                if ttc_level in (
+                        'medium',
+                        'high'
+                ):
+                    has_display_ttc_risk = True
+
+            # ======================================================
+            # 跟车过近风险
+            # ======================================================
+
+            following_draw_info = (
+                following_risk_by_vehicle.get(
+                    int(track_id)
+                )
+            )
+
+            has_display_following_risk = False
+            following_level = 'none'
+            following_front_id = None
+            following_gap_ratio = None
+
+            if following_draw_info is not None:
+
+                following_level = following_draw_info[
+                    'risk_level'
+                ]
+
+                following_front_id = following_draw_info[
+                    'front_track_id'
+                ]
+
+                following_gap_ratio = following_draw_info[
+                    'gap_ratio'
+                ]
+
+                # low 先只保留数据
+                # medium / high 才显示到视频
+                if following_level in (
+                        'medium',
+                        'high'
+                ):
+                    has_display_following_risk = True
+
+            # ======================================================
+            # 检测框显示优先级
+            #
+            # 1. 人车冲突
+            # 2. TTC 碰撞风险
+            # 3. 逆行
+            # 4. 异常停车
+            # 5. 跟车过近
+            # 6. 正常目标
+            # ======================================================
+
+            if has_display_pedestrian_risk:
+
+                if pedestrian_level == 'high':
+                    box_color = (
+                        0,
+                        0,
+                        255
+                    )
+                else:
+                    box_color = (
+                        0,
+                        255,
+                        255
+                    )
+
+                title = (
+                    'PEDESTRIAN RISK '
+                    'V:{} P:{} '
+                    '{:.1f}s'
+                ).format(
+                    track_id,
+                    pedestrian_person_id,
+                    pedestrian_seconds
+                )
+
+
+            elif has_display_ttc_risk:
+
+                if ttc_level == 'high':
+                    box_color = (
+                        0,
+                        0,
+                        255
+                    )
+                else:
+                    box_color = (
+                        0,
+                        165,
+                        255
+                    )
+
+                title = (
+                    'COLLISION RISK '
+                    'ID:{}-{} '
+                    'TTC:{:.1f}s'
+                ).format(
+                    track_id,
+                    ttc_other_id,
+                    ttc_seconds
+                )
+
+
+            elif is_reverse:
+
+                box_color = (
+                    0,
+                    0,
+                    255
+                )
+
+                title = (
+                    'WRONG WAY '
+                    'ID:{} {} {:.1f}s'
+                ).format(
+                    track_id,
+                    label,
+                    reverse_duration
+                )
+
+
+            elif is_abnormal_stop:
+
+                box_color = (
+                    0,
+                    0,
+                    255
+                )
+
+                title = (
+                    'STOP '
+                    'ID:{} {} {:.1f}s'
+                ).format(
+                    track_id,
+                    label,
+                    stationary_duration
+                )
+
+
+            elif has_display_following_risk:
+
+                if following_level == 'high':
+                    box_color = (
+                        0,
+                        0,
+                        255
+                    )
+                else:
+                    box_color = (
+                        0,
+                        165,
+                        255
+                    )
+
+                title = (
+                    'FOLLOWING TOO CLOSE '
+                    'ID:{}->{} '
+                    'GAP:{:.2f}'
+                ).format(
+                    track_id,
+                    following_front_id,
+                    following_gap_ratio
+                )
+
+
+            else:
+
+                box_color = (
+                    0,
+                    255,
+                    0
+                )
+
+                title = '{} ID:{} {:.2f}'.format(
+                    label,
+                    track_id,
+                    confidence
+                )
+
+            # 绘制检测框
             cv2.rectangle(
                 output_image_frame,
                 (int(x1), int(y1)),
                 (int(x2), int(y2)),
-                (0, 255, 0),
+                box_color,
                 2
             )
 
-            # 标签
-            title = '{} ID:{} {:.2f}'.format(
-                label,
-                track_id,
-                confidence
-            )
-
+            # 绘制文字
             cv2.putText(
                 output_image_frame,
                 title,
@@ -1150,7 +2609,7 @@ def detect_gen():
                 ),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.55,
-                (0, 255, 0),
+                box_color,
                 2,
                 cv2.LINE_AA
             )
@@ -1209,14 +2668,145 @@ def detect_gen():
         # 输出图片(带有标注线)
         output_image_frame = cv2.add(output_image_frame, color_polygons_image)
 
-        if len(list_bboxs) > 0:
-            # 实时交通状态显示
-            if len(list_bboxs) > 20:
-                style = '拥堵'
+        # ==========================================================
+        # 新版交通状态判断 V1
+        # 车辆数量 + 平均速度 + 静止比例 + 画面占用率
+        # ==========================================================
+
+        # 当前这一帧真实车辆数
+        current_vehicle_count = traffic_analysis['vehicle_count']
+
+        # 最近 3 秒平均数据，用于判断交通状态
+        vehicle_count = traffic_window['vehicle_count']
+        average_speed = traffic_window['average_speed_px_s']
+        stopped_ratio = traffic_window['stopped_ratio']
+        occupancy_ratio = traffic_window['occupancy_ratio']
+
+        # ----------------------------------------------------------
+        # 交通状态
+        # ----------------------------------------------------------
+
+        if vehicle_count == 0:
+
+            style = '畅通'
+
+        elif (
+                vehicle_count >= 8
+                and occupancy_ratio >= 0.08
+                and stopped_ratio >= 0.60
+                and average_speed < 20
+        ):
+
+            style = '严重拥堵'
+
+        elif (
+                vehicle_count >= 6
+                and occupancy_ratio >= 0.06
+                and stopped_ratio >= 0.40
+                and average_speed < 35
+        ):
+
+            style = '拥堵'
+
+        elif (
+                vehicle_count >= 4
+                and occupancy_ratio >= 0.05
+                and (
+                        stopped_ratio >= 0.25
+                        or average_speed < 45
+                )
+        ):
+
+            style = '缓行'
+
+        elif (
+                vehicle_count <= 2
+                and stopped_ratio < 0.50
+                and average_speed >= 35
+        ):
+
+            style = '畅通'
+
+        else:
+
+            style = '正常'
+
+        # ----------------------------------------------------------
+        # 写给网页
+        # ----------------------------------------------------------
+
+        # ==========================================================
+        # 交通状态防抖
+        # 候选状态必须连续保持 2 秒，才真正切换网页状态
+        # ==========================================================
+
+        if style == stable_style:
+
+            # 当前计算结果和已经显示的状态一致
+            # 取消之前正在等待确认的状态
+            candidate_style = stable_style
+            candidate_style_since = None
+
+        else:
+
+            # 出现了一个新的候选状态
+            if style != candidate_style:
+
+                candidate_style = style
+                candidate_style_since = analysis_timestamp
+
             else:
-                style = '正常'
-            json_dict['style'] = style
-            json_dict['len_list'] = str(len(list_bboxs))
+
+                # 候选状态一直没有变化
+                if candidate_style_since is None:
+
+                    candidate_style_since = analysis_timestamp
+
+                elif (
+                        analysis_timestamp
+                        - candidate_style_since
+                        >= STYLE_HOLD_SECONDS
+                ):
+
+                    # 连续保持足够时间，正式切换
+                    stable_style = candidate_style
+
+                    candidate_style_since = None
+
+        # 网页只显示已经确认的稳定状态
+        json_dict['style'] = stable_style
+        # ==========================================================
+        # 每 60 帧输出一次交通状态防抖过程
+        # ==========================================================
+
+        if candidate_style_since is None:
+            candidate_hold_time = 0.0
+        else:
+            candidate_hold_time = max(
+                0.0,
+                analysis_timestamp - candidate_style_since
+            )
+
+        if analysis_frame_index % 60 == 0:
+            print(
+                '[STATUS] '
+                '原始={} '
+                '候选={} '
+                '稳定={} '
+                '候选持续={:.2f}s'.format(
+                    style,
+                    candidate_style,
+                    stable_style,
+                    candidate_hold_time
+                )
+            )
+        json_dict['len_list'] = str(current_vehicle_count)
+
+        # ==========================================================
+        # 后面仍然只在存在检测目标时进行撞线判断
+        # ==========================================================
+
+        if len(list_bboxs) > 0:
             # ----------------------判断撞线----------------------
             for item_bbox in list_bboxs:
                 x1, y1, x2, y2, label, track_id, _ = item_bbox
@@ -1237,7 +2827,13 @@ def detect_gen():
                 list_sum.append(label)
                 # 将流量总数存入json
                 for label_sum in list_sum:
-                    if label_sum in ['car', 'bus', 'truck']:
+                    if label_sum in [
+                        'car',
+                        'bus',
+                        'truck',
+                        'motorcycle',
+                        'bicycle'
+                    ]:
                         sum_vehicle += 1
                     if label_sum == 'person':
                         sum_person += 1
@@ -1687,10 +3283,24 @@ def detect_gen():
                 ) as f_3:
 
                     json.dump(
-                        list_dic,
+                        active_vehicle_list,
                         f_3
                     )
+                with open(
+                        os.path.join(
+                            base_filename,
+                            'templates',
+                            'json_traffic_alerts.json'
+                        ),
+                        'w+',
+                        encoding='utf-8'
+                ) as f_5:
 
+                    json.dump(
+                        current_traffic_alerts,
+                        f_5,
+                        ensure_ascii=False
+                    )
                 with open(
                         os.path.join(
                             base_filename,
@@ -1719,13 +3329,38 @@ def detect_gen():
         output_image_frame = cv2.resize(output_image_frame, (img_size_start_w, img_size_start_h))
         frame = output_image_frame
         frame = cv2.imencode('.jpg', frame)[1].tobytes()
-        yield b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n'
+        try:
+            yield (
+                    b'--frame\r\n'
+                    b'Content-Type: image/jpeg\r\n\r\n'
+                    + frame
+                    + b'\r\n'
+            )
+
+        except GeneratorExit:
+
+            # 网页关闭视频流时释放资源
+            if capture is not None:
+                capture.release()
+
+            if network_reader is not None:
+                network_reader.release()
+
+            return
 
         # 清空方式以及总数相关信息的字典, 方便后面写入以及json的数据的读取
         json_dict.clear()
         json_dict_style.clear()
 
+    # ==========================================================
+    # detect_gen 正常结束时释放视频资源
+    # ==========================================================
 
+    if capture is not None:
+        capture.release()
+
+    if network_reader is not None:
+        network_reader.release()
 # ==========================================================
 # 独立事故检测模块
 # ==========================================================
